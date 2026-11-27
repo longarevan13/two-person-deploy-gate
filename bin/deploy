@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# deploy: a two-person release gate for a single host.
+#
+# Install as /opt/app/bin/deploy (root:root 0755). It is the only thing the deploy
+# SSH key can run. sshd forces, in the deploy user's authorized_keys:
+#   command="sudo /opt/app/bin/deploy",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding
+# and sudoers keeps SSH_ORIGINAL_COMMAND so this script can read what the client asked for.
+#
+# Accepted commands (anything else is refused):
+#   frontend <release-tag>      install a frontend release
+#   backend <release-tag>       install a backend release
+#   rollback frontend|backend   switch back to the previous installed release (no approval needed)
+#   status                      show what is installed
+#
+# Every install is checked against GitHub before anything changes:
+#   - the tag's commit is on main,
+#   - it is the merge commit of a PR into main,
+#   - that PR has an APPROVED review, on its final head commit, from someone in
+#     $ROOT/etc/approvers who is not the PR's author,
+#   - the release asset's sha256 matches the published checksum file.
+# This is the two-person rule on a plan without protected environments: it is
+# enforced on the server, where neither workflow files nor repo settings can switch it off.
+#
+# Never touches anything outside $ROOT, and only ever starts, stops or
+# inspects containers whose names start with $CONTAINER_PREFIX.
+set -euo pipefail
+umask 022
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---------- settings (edit for your project) ----------
+ROOT=${GATE_ROOT:-/opt/app}         # overridable only for the test harness; sudo drops env
+API=${GATE_GITHUB_API:-https://api.github.com}
+ORG=your-org
+CONTAINER_PREFIX=app-
+BACKEND_CONTAINER=app-backend
+KEEP=5
+TAG_RE='^release-[0-9]{8}-[0-9a-f]{7,40}$'
+
+TOKEN_FILE=$ROOT/.deploy-token
+APPROVERS_FILE=$ROOT/etc/approvers
+LOG=$ROOT/log/deploy.log
+
+declare -A REPO=([frontend]="$ORG/app-frontend" [backend]="$ORG/app-backend")
+# Where each component's releases live, and how to health-check it.
+declare -A DIR=([frontend]="$ROOT/web" [backend]="$ROOT/backend/code")
+FRONTEND_HEALTH_URL=${FRONTEND_HEALTH_URL:-http://127.0.0.1:8201/release.json}
+BACKEND_HEALTH_URL=${BACKEND_HEALTH_URL:-http://127.0.0.1:8206/api/health}
+
+mkdir -p "$ROOT/log" "$ROOT/state" "$ROOT/backups" "$ROOT/tmp"
+say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
+die() { say "REFUSED: $*"; exit 1; }
+
+# One deploy at a time.
+exec 9>"$ROOT/state/.lock"
+flock -n 9 || die "another deploy is running"
+
+# ---------- GitHub API (token never appears in argv or logs) ----------
+gh_api() { # gh_api <path> [accept]
+  local accept=${2:-application/vnd.github+json}
+  [ -r "$TOKEN_FILE" ] || die "missing $TOKEN_FILE"
+  { printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n' <"$TOKEN_FILE")"
+    printf 'header = "Accept: %s"\n' "$accept"
+    printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'; } |
+    curl -fsSL --max-time 60 -K - "$API$1"
+}
+json() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
+
+verify_release() { # verify_release <component> <tag>  -> prints commit sha
+  local comp=$1 tag=$2 repo=${REPO[$1]} ref sha kind
+  ref=$(gh_api "/repos/$repo/git/ref/tags/$tag") || die "tag $tag not found in $repo"
+  kind=$(json 'print(d["object"]["type"])' <<<"$ref"); sha=$(json 'print(d["object"]["sha"])' <<<"$ref")
+  if [ "$kind" = tag ]; then sha=$(gh_api "/repos/$repo/git/tags/$sha" | json 'print(d["object"]["sha"])'); fi
+
+  local cmp; cmp=$(gh_api "/repos/$repo/compare/main...$sha" | json 'print(d["status"])')
+  case "$cmp" in identical|behind) ;; *) die "$tag ($sha) is not on main (compare: $cmp)";; esac
+
+  local approvers; approvers=$(grep -v -E '^\s*(#|$)' "$APPROVERS_FILE" | tr '\n' ' ')
+  local verdict
+  verdict=$(gh_api "/repos/$repo/commits/$sha/pulls" | SHA="$sha" python3 -c '
+import json,os,sys
+prs=[p for p in json.load(sys.stdin) if p.get("merged_at") and p["base"]["ref"]=="main" and p.get("merge_commit_sha")==os.environ["SHA"]]
+print(prs[0]["number"] if prs else "")') || true
+  [ -n "$verdict" ] || die "$sha is not the merge commit of a merged PR into main (direct pushes are never deployed)"
+  local pr=$verdict prjson reviews
+  prjson=$(gh_api "/repos/$repo/pulls/$pr")
+  reviews=$(gh_api "/repos/$repo/pulls/$pr/reviews?per_page=100")
+  verdict=$(PR="$prjson" APPROVERS="$approvers" python3 -c '
+import json,os,sys
+pr=json.loads(os.environ["PR"]); rv=json.load(sys.stdin)
+author=pr["user"]["login"].lower(); head=pr["head"]["sha"]
+allowed={a.lower() for a in os.environ["APPROVERS"].split()}
+last={}
+for r in rv:
+    if r["state"] in ("APPROVED","CHANGES_REQUESTED","DISMISSED"):
+        last[r["user"]["login"].lower()]=r
+ok=[u for u,r in last.items() if r["state"]=="APPROVED" and r["commit_id"]==head and u!=author and u in allowed]
+print(("OK " + ",".join(ok) + " author=" + author) if ok else ("NO author=" + author + " reviews=" + ",".join(u+":"+r["state"] for u,r in last.items())))' <<<"$reviews")
+  case "$verdict" in OK*) say "approval check PR #$pr: $verdict";; *) die "PR #$pr has no approval from a second person on its final commit ($verdict)";; esac
+  printf '%s' "$sha"
+}
+
+fetch_asset() { # fetch_asset <component> <tag> <outdir>  -> path of verified tarball
+  local comp=$1 tag=$2 out=$3 repo=${REPO[$1]} rel name="$1-$2.tar.gz"
+  rel=$(gh_api "/repos/$repo/releases/tags/$tag") || die "no GitHub release for $tag"
+  local aid sid
+  aid=$(N="$name" json 'import os; print(next((a["id"] for a in d["assets"] if a["name"]==os.environ["N"]),""))' <<<"$rel")
+  sid=$(N="$name.sha256" json 'import os; print(next((a["id"] for a in d["assets"] if a["name"]==os.environ["N"]),""))' <<<"$rel")
+  [ -n "$aid" ] && [ -n "$sid" ] || die "release $tag lacks $name or $name.sha256"
+  gh_api "/repos/$repo/releases/assets/$aid" application/octet-stream >"$out/$name"
+  gh_api "/repos/$repo/releases/assets/$sid" application/octet-stream >"$out/$name.sha256"
+  local want got
+  want=$(awk '{print $1; exit}' "$out/$name.sha256"); got=$(sha256sum "$out/$name" | awk '{print $1}')
+  [ -n "$want" ] && [ "$want" = "$got" ] || die "sha256 mismatch for $name (want $want, got $got)"
+  say "sha256 verified $name $got"
+  printf '%s' "$out/$name"
+}
+
+# ---------- release directories ----------
+current_of() { readlink "${DIR[$1]}/current" 2>/dev/null | sed 's#^releases/##' || true; }
+swap_to() { # atomic symlink swap, relative so it resolves inside containers too
+  local comp=$1 tag=$2 d=${DIR[$1]}
+  [ -d "$d/releases/$tag" ] || die "release $tag is not installed"
+  ln -sfn "releases/$tag" "$d/current.new" && mv -Tf "$d/current.new" "$d/current"
+}
+record() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$2" >>"$ROOT/state/$1.history"; }
+previous_of() { # the most recent history entry that is installed and differs from current
+  local comp=$1 cur; cur=$(current_of "$comp")
+  [ -f "$ROOT/state/$comp.history" ] || return 0
+  tac "$ROOT/state/$comp.history" | awk '{print $2}' | while read -r t; do
+    if [ "$t" != "$cur" ] && [ -d "${DIR[$comp]}/releases/$t" ]; then echo "$t"; break; fi
+  done
+  return 0
+}
+prune() { # keep the newest $KEEP releases, never the current or previous one
+  local comp=$1 d=${DIR[$1]} cur prev
+  cur=$(current_of "$comp"); prev=$(previous_of "$comp")
+  ls -1t "$d/releases" | tail -n +$((KEEP + 1)) | while read -r t; do
+    [ "$t" = "$cur" ] || [ "$t" = "$prev" ] || { rm -rf -- "$d/releases/$t"; say "pruned $comp $t"; }
+  done
+}
+
+health() { # health <component> <tag>
+  local comp=$1 tag=$2 body
+  for _ in $(seq 1 "${HEALTH_TRIES:-30}"); do
+    if [ "$comp" = frontend ]; then
+      body=$(curl -fsS --max-time 3 "$FRONTEND_HEALTH_URL" 2>/dev/null || true)
+      grep -q "\"$tag\"" <<<"$body" && return 0
+    else
+      [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$BACKEND_HEALTH_URL" || true)" = 200 ] && return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+container_exists() { docker inspect "$1" >/dev/null 2>&1; }
+
+backend_backup() { # stop, archive the data folder, start again; prints archive path
+  local ts f; ts=$(date -u +%Y%m%d-%H%M%S); f=$ROOT/backups/data-$ts.tar.gz
+  docker stop -t 20 "$BACKEND_CONTAINER" >/dev/null
+  tar -czf "$f" -C "$ROOT/backend" data
+  gzip -t "$f" || { docker start "$BACKEND_CONTAINER" >/dev/null; die "backup archive failed integrity check"; }
+  sha256sum "$f" >"$f.sha256"
+  printf '%s' "$f"
+}
+
+install() { # install <component> <tag>
+  local comp=$1 tag=$2 d=${DIR[$1]} work sha tarball prev
+  [[ $tag =~ $TAG_RE ]] || die "bad tag format: $tag"
+  if [ "$comp" = backend ] && ! container_exists "$BACKEND_CONTAINER"; then die "backend is not installed on this host yet"; fi
+  sha=$(verify_release "$comp" "$tag")
+  work=$(mktemp -d "$ROOT/tmp/$comp-XXXX"); trap 'rm -rf "$work"' RETURN
+  tarball=$(fetch_asset "$comp" "$tag" "$work")
+  mkdir -p "$d/releases"
+  rm -rf -- "$d/releases/$tag.partial"; mkdir "$d/releases/$tag.partial"
+  tar -xzf "$tarball" -C "$d/releases/$tag.partial" --no-same-owner --no-same-permissions
+  rm -rf -- "$d/releases/$tag"; mv "$d/releases/$tag.partial" "$d/releases/$tag"
+  prev=$(current_of "$comp")
+
+  if [ "$comp" = backend ]; then
+    local bk; bk=$(backend_backup); say "backend backup $bk"
+    swap_to backend "$tag"; docker start "$BACKEND_CONTAINER" >/dev/null
+    if ! health backend "$tag"; then
+      say "backend health failed for $tag, restoring code $prev and data $bk"
+      docker stop -t 20 "$BACKEND_CONTAINER" >/dev/null || true
+      [ -n "$prev" ] && swap_to backend "$prev"
+      rm -rf -- "$ROOT/backend/data.failed"; mv "$ROOT/backend/data" "$ROOT/backend/data.failed"
+      tar -xzf "$bk" -C "$ROOT/backend"
+      docker start "$BACKEND_CONTAINER" >/dev/null
+      die "backend $tag failed its health check; rolled back to ${prev:-nothing}"
+    fi
+  else
+    swap_to frontend "$tag"
+    if ! health frontend "$tag"; then
+      [ -n "$prev" ] && swap_to frontend "$prev"
+      die "frontend $tag failed its health check; rolled back to ${prev:-nothing}"
+    fi
+  fi
+  record "$comp" "$tag"; prune "$comp"
+  say "DEPLOYED $comp $tag ($sha) previous=${prev:-none}"
+}
+
+rollback() {
+  local comp=$1 prev cur; cur=$(current_of "$comp"); prev=$(previous_of "$comp")
+  [ -n "$prev" ] || die "no previous $comp release to roll back to"
+  if [ "$comp" = backend ]; then
+    container_exists "$BACKEND_CONTAINER" || die "backend is not installed on this host yet"
+    docker stop -t 20 "$BACKEND_CONTAINER" >/dev/null; swap_to backend "$prev"; docker start "$BACKEND_CONTAINER" >/dev/null
+    say "NOTE: backend rollback switches code only. Data written by newer migrations stays; restoring data is a separate, deliberate step."
+  else
+    swap_to frontend "$prev"
+  fi
+  health "$comp" "$prev" || die "rolled back $comp to $prev but its health check failed"
+  record "$comp" "$prev"
+  say "ROLLED BACK $comp $cur -> $prev"
+}
+
+status() {
+  for c in frontend backend; do
+    printf '%-9s current=%s previous=%s installed=%s\n' "$c" "$(current_of $c)" "$(previous_of $c)" \
+      "$(ls -1 "${DIR[$c]}/releases" 2>/dev/null | wc -l)"
+  done
+  docker ps --filter name="^$CONTAINER_PREFIX" --format '{{.Names}} {{.Status}}' 2>/dev/null || true
+  # shellcheck disable=SC2046  # intentional: one argument per container id
+  docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' $(docker ps -q --filter name="^$CONTAINER_PREFIX" 2>/dev/null) 2>/dev/null || true
+}
+
+# ---------- entry ----------
+read -r -a ARGS <<<"${SSH_ORIGINAL_COMMAND:-$*}"
+say "request from ${SUDO_USER:-${USER:-unknown}}: ${ARGS[*]:-<none>}"
+case "${ARGS[0]:-}:${#ARGS[@]}" in
+  frontend:2|backend:2) install "${ARGS[0]}" "${ARGS[1]}" ;;
+  rollback:2) case "${ARGS[1]}" in frontend|backend) rollback "${ARGS[1]}" ;; *) die "rollback frontend|backend";; esac ;;
+  status:1) status ;;
+  *) die "usage: frontend <tag> | backend <tag> | rollback frontend|backend | status" ;;
+esac
